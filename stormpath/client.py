@@ -1,9 +1,14 @@
 """Stormpath API client."""
 
 
-from .auth import Auth
+try:
+    from google.appengine.api import urlfetch
+    from .http import AppEngineHttpExecutor
+    IS_GOOGLE_APPENGINE = True
+except ImportError:
+    from .auth import Auth
+    from .http import HttpExecutor
 from .data_store import DataStore
-from .http import HttpExecutor
 from .resources.account import AccountList
 from .resources.account_store_mapping import AccountStoreMappingList
 from .resources.agent import AgentList
@@ -62,8 +67,12 @@ class Client(object):
         """
         self.BASE_URL = base_url or self.BASE_URL
 
-        self.auth = Auth(**auth_kwargs)
-        executor = HttpExecutor(self.BASE_URL, self.auth.scheme, proxies, user_agent=user_agent, get_delay=backoff_strategy)
+        if IS_GOOGLE_APPENGINE:
+            executor = AppEngineHttpExecutor(self.BASE_URL, auth_kwargs, proxies, user_agent=user_agent,
+                                    get_delay=backoff_strategy)
+        else:
+            self.auth = Auth(**auth_kwargs)
+            executor = HttpExecutor(self.BASE_URL, self.auth.scheme, proxies, user_agent=user_agent, get_delay=backoff_strategy)
         self.data_store = DataStore(executor, cache_options)
         self.tenant = Tenant(client=self, href='/tenants/current', expand=expand)
 

@@ -1,13 +1,20 @@
 """HTTP request handling utilities."""
+import base64
 
 import cgi
 import time
 import random
 
 from collections import OrderedDict
-from json import dumps
-from requests import Session
-from requests.exceptions import RequestException
+from json import dumps, loads
+
+try:
+    from google.appengine.api import urlfetch
+    IS_GOOGLE_APPENGINE = True
+except ImportError:
+    from requests import Session
+    from requests.exceptions import RequestException
+    IS_GOOGLE_APPENGINE = False
 from sys import version_info as vi
 
 # Hack for Google App Engine
@@ -48,19 +55,20 @@ class HttpExecutor(object):
     DEFAULT_MAX_RETRIES = 4
     MAX_BACKOFF_IN_MILLISECONDS = 20 * 1000
 
-    os_info = platform()
-    os_versions = {
-        'Linux': "%s (%s)" % (linux_distribution()[0], os_info),
-        'Windows': "%s (%s)" % (win32_ver()[0], os_info),
-        'Darwin': "%s (%s)" % (mac_ver()[0], os_info),
-    }
+    if not IS_GOOGLE_APPENGINE:
+        os_info = platform()
+        os_versions = {
+            'Linux': "%s (%s)" % (linux_distribution()[0], os_info),
+            'Windows': "%s (%s)" % (win32_ver()[0], os_info),
+            'Darwin': "%s (%s)" % (mac_ver()[0], os_info),
+        }
 
-    USER_AGENT = 'stormpath-sdk-python/%s python/%s %s/%s' % (
-        STORMPATH_VERSION,
-        '%s.%s.%s' % (vi.major, vi.minor, vi.micro),
-        system(),
-        os_versions.get(system(), ''),
-    )
+        USER_AGENT = 'stormpath-sdk-python/%s python/%s %s/%s' % (
+            STORMPATH_VERSION,
+            '%s.%s.%s' % (vi.major, vi.minor, vi.micro),
+            system(),
+            os_versions.get(system(), ''),
+        )
 
     def __init__(self, base_url, auth, proxies=None, user_agent=None, get_delay=None):
         # If a custom user agent is specified, we'll append it to the end of
@@ -139,11 +147,7 @@ class HttpExecutor(object):
         return d
 
     def request(self, method, url, data=None, params=None, retry_count=0):
-        if params:
-            params = OrderedDict(sorted(params.items()))
-
-        if not url.startswith(self.base_url):
-            url = self.base_url + url
+        params, url = self._prep_request(params, url)
 
         try:
             r = self.session.request(method, url, data=data, params=params,
@@ -154,24 +158,33 @@ class HttpExecutor(object):
                 self.request(method, url, data=data, params=params, retry_count=retry_count + 1)
             raise Error({'developerMessage': str(e)})
 
-        log.debug('HttpExecutor.request(method=%s, url=%s, params=%s, data=%s) -> [%d] %s' %
-            (method, url, repr(params), repr(data), r.status_code, r.text))
+        return self._request_process(data, method, params, r, retry_count, url)
 
+    def _prep_request(self, params, url):
+        if params:
+            params = OrderedDict(sorted(params.items()))
+        if not url.startswith(self.base_url):
+            url = self.base_url + url
+        return params, url
+
+    def _request_process(self, data, method, params, r, retry_count, url):
+        log.debug('HttpExecutor.request(method=%s, url=%s, params=%s, data=%s) -> [%d] %s' %
+                  (method, url, repr(params), repr(data), r.status_code, r.text))
         if r.status_code in [301, 302] and 'location' in r.headers:
             if not r.headers['location'].startswith(self.base_url):
                 message = 'Trying to redirect outside of API base url: %s' % \
-                    r.headers['location']
-                raise Error({'developerMessage': message} )
-            return self.request('GET', r.headers['location'], params=params)
+                          r.headers['location']
+                raise Error({'developerMessage': message})
+            return_value = self.request('GET', r.headers['location'], params=params)
 
-        if r.status_code >= 400 and r.status_code <= 600:
+        elif r.status_code >= 400 and r.status_code <= 600:
             if self.should_retry(retry_count, r.status_code):
                 self.pause_exponentially(retry_count)
                 self.request(method, url, data=data, params=params, retry_count=retry_count + 1)
             else:
                 self.raise_error(r)
-
-        return self.return_response(r)
+        return_value = self.return_response(r)
+        return return_value
 
     def get(self, url, params=None):
         return self.request('GET', url, params=params)
@@ -181,3 +194,52 @@ class HttpExecutor(object):
 
     def delete(self, url):
         return self.request('DELETE', url)
+
+class AppEngineHttpExecutor(HttpExecutor):
+    def __init__(self, base_url, auth, proxies=None, user_agent=None, get_delay=None):
+        # If a custom user agent is specified, we'll append it to the end of
+        # our built-in user agent.  This way we'll get very detailed user agent
+        # strings.
+        self.get_delay = get_delay
+        self.base_url = base_url
+        self.auth = auth
+
+    def request(self, method, url, data=None, params=None, retry_count=0):
+        params, url = self._prep_request(params, url)
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": "Basic %s" % base64.b64encode("%s:%s" % (self.auth['api_key_id'],
+                                                                      self.auth['api_key_secret']))
+        }
+
+        try:
+            r = urlfetch.fetch(
+                url=url,
+                payload=data,
+                method=method,
+                headers=headers,
+                validate_certificate=True)
+            r.text = r.content
+            r.json = lambda _: loads(r.content)
+
+        except Exception as e:
+            raise
+            if self.should_retry(retry_count, e):
+                self.pause_exponentially(retry_count)
+                self.request(method, url, data=data, params=params, retry_count=retry_count + 1)
+            raise Error({'developerMessage': str(e)})
+
+        return self._request_process(data, method, params, r, retry_count, url)
+
+    def is_throttling_or_unexpected_error(self, status):
+        """Helper method for determining if the request was told to back off,
+        or if an unexpected error in the 5xx range occured."""
+
+        if isinstance(status, Exception):
+            return True
+        elif isinstance(status, int) and (status == 429 or status >= 500):
+            return True
+        else:
+            return False
